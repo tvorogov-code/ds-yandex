@@ -1,9 +1,9 @@
-from pyspark import SparkConf
+from pyspark import SparkConf, StorageLevel
 from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
 
-MAX_AUDITION_HOURS = 3.94
-MAX_CONTENT_LENGTH_HOURS = 3.8
+MAX_AUDITION_HOURS = 24
+MAX_CONTENT_LENGTH_HOURS = 24
 
 # Создание Spark-сессии с параметрами в виде словаря
 def create_spark_session_dict(appName, master="yarn", conf_dict=None):
@@ -81,25 +81,27 @@ def build_marts(df_audition, df_content, start_date=None, end_date=None, geo_id=
                             )
                         .withColumn('finished_percent',
                                     F.when(F.col('main_content_duration_hours') == 0, 100)
-                                    .otherwise(F.col('total_hours') / F.col('main_content_duration_hours') * 100))
+                                    .otherwise(F.least(F.lit(1.0), F.col('total_hours') / F.col('main_content_duration_hours')) * 100))
                         .withColumn('is_completed', F.col('finished_percent') >= 100)
                         .withColumn('days_spent', F.datediff(F.col('last_listening_date'), F.col('first_listening_date')) + 1))
 
+    user_content_mart_full.repartition('puid').persist(StorageLevel.MEMORY_AND_DISK)
+    
     user_content_mart = (user_content_mart_full
                         .drop('first_listening_date', 'main_content_duration_hours', 
                             'adult_content_flg', 'kids_content_flg', 'main_content_type'))
-
+    
     user_genre_content_mart = (df_joined_filtered_split
-                   .groupBy('puid', 
-                            'published_topic_title', 
-                            'main_content_id', 
-                            'main_content_duration_hours', 
-                            'adult_content_flg', 
-                            'kids_content_flg')
-                   .agg(
-                       F.sum('hours').alias('total_hours_cont'),
-                       F.count('audition_id').alias('sessions_count_cont')
-                       ))
+                    .groupBy('puid', 
+                                'published_topic_title', 
+                                'main_content_id', 
+                                'main_content_duration_hours', 
+                                'adult_content_flg', 
+                                'kids_content_flg')
+                    .agg(
+                        F.sum('hours').alias('total_hours_cont'),
+                        F.count('audition_id').alias('sessions_count_cont')
+                        ))
 
     # Логика поиска любимого жанра, платформы, типа контента
     favourites_window = (Window.partitionBy('puid')
@@ -118,15 +120,16 @@ def build_marts(df_audition, df_content, start_date=None, end_date=None, geo_id=
                         )
                         .withColumnRenamed('published_topic_title', 'genre')
                         .withColumn('genre_rank', 
-                                    F.row_number()
+                                    F.dense_rank()
                                     .over(favourites_window)))
 
-        # Агрегация по жанру
+    user_genre_mart.repartition('puid').persist(StorageLevel.MEMORY_AND_DISK)
+    
+    # Агрегация по жанру
     user_genre_agg = (user_genre_mart
-                    .withColumn('favorite_genre',
-                                F.first('genre').over(Window.partitionBy('puid').orderBy('genre_rank')))
-                    .groupBy('puid', 'favorite_genre')
-                    .agg(F.count('genre').alias('unique_genres_count')))
+                    .groupBy('puid')
+                    .agg(F.count('genre').alias('unique_genres_count'),
+                        F.min_by('genre', 'genre_rank').alias('favourite_genre')))
 
     # Агрегация по платформе
     user_platform_agg = (df_audition
@@ -135,7 +138,7 @@ def build_marts(df_audition, df_content, start_date=None, end_date=None, geo_id=
                             F.count('audition_id').alias('sessions_count'),
                             F.sum('hours').alias('total_hours')
                             )
-                        .withColumn('rank', F.row_number().over(favourites_window))
+                        .withColumn('rank', F.dense_rank().over(favourites_window))
                         .filter(F.col('rank') == 1)
                         .select('puid', F.col('usage_platform_ru').alias('favourite_platform')))
 
@@ -144,22 +147,22 @@ def build_marts(df_audition, df_content, start_date=None, end_date=None, geo_id=
                 .join(user_genre_agg, on='puid', how='inner')
                 .join(user_platform_agg, on='puid', how='inner')
                 .withColumn('favorite_content_type', F.first('main_content_type').over(favourites_window))
-                .groupBy('puid', 'unique_genres_count', 'favorite_genre', 'favorite_content_type', 'favourite_platform')
+                .groupBy('puid', 'unique_genres_count', 'favourite_genre', 'favorite_content_type', 'favourite_platform')
                 .agg(
                     F.sum('total_hours').alias('total_hours'),
                     F.count('main_content_id').alias('unique_content_count'),
                     F.min('first_listening_date').alias('first_listening_date'),
-                    F.max('last_listening_date').alias('last_listening_date'),
+                    F.max('last_listening_date').alias('last_date'),
                     (100 * F.mean(F.col('is_completed').cast('int'))).alias('completion_rate'),
                     F.count_if('adult_content_flg').alias('adult_content_count'),
                     F.count_if('kids_content_flg').alias('kids_content_count')
                     )
-                .withColumn('days_spent', F.datediff(F.col('last_listening_date'), F.col('first_listening_date')) + 1)
-                .withColumnRenamed('last_listening_date', 'last_date'))
-
+                .withColumn('active_days', F.datediff(F.col('last_date'), F.col('first_listening_date')) + 1)
+                .drop('first_listening_date', 'last_listening_date'))
+        
     content_platform_agg = (df_audition
-                     .groupBy('main_content_id')
-                     .agg(F.countDistinct('usage_platform_ru').alias('platforms_count')))
+                        .groupBy('main_content_id')
+                        .agg(F.countDistinct('usage_platform_ru').alias('platforms_count')))
 
     content_mart = (user_content_mart_full
                     .groupBy('main_content_id', 'main_content_duration_hours')
@@ -167,7 +170,7 @@ def build_marts(df_audition, df_content, start_date=None, end_date=None, geo_id=
                         F.count('puid').alias('unique_users'),
                         F.sum('total_hours').alias('total_hours'),
                         F.mean(F.when(F.col('main_content_duration_hours') == 0, 100)
-                                .otherwise(100 * F.col('total_hours') / F.col('main_content_duration_hours')))
+                                .otherwise(100 * F.least(F.lit(1), F.col('total_hours') / F.col('main_content_duration_hours'))))
                         .alias('avg_finished_percent')
                         )
                     .join(content_platform_agg, on='main_content_id', how='inner')
